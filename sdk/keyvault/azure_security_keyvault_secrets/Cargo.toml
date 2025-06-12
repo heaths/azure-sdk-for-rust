@@ -15,7 +15,7 @@ categories = ["api-bindings"]
 
 [dependencies]
 async-trait = { workspace = true }
-azure_core = { workspace = true }
+azure_core = "0.25.0"
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

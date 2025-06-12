@@ -170,6 +170,7 @@ pub struct RestoreSecretParameters {
 /// A secret consisting of a value, id and its attributes.
 #[derive(Clone, Default, Deserialize, SafeDebug, Serialize)]
 #[non_exhaustive]
+#[safe(true)]
 pub struct Secret {
     /// The secret management attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,10 +181,12 @@ pub struct Secret {
     pub content_type: Option<String>,
 
     /// The secret id.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
     /// If this is a secret backing a KV certificate, then this field specifies the corresponding key backing the KV certificate.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kid: Option<String>,
 
@@ -193,16 +196,19 @@ pub struct Secret {
     pub managed: Option<bool>,
 
     /// Application specific metadata in the form of key-value pairs.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
 
     /// The secret value.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
 }
 
 /// The secret management attributes.
 #[derive(Clone, Default, Deserialize, SafeDebug, Serialize)]
+#[safe(true)]
 pub struct SecretAttributes {
     /// Creation time in UTC.
     #[serde(
@@ -256,6 +262,7 @@ pub struct SecretAttributes {
 /// The secret item containing secret metadata.
 #[derive(Clone, Default, Deserialize, SafeDebug, Serialize)]
 #[non_exhaustive]
+#[safe(true)]
 pub struct SecretProperties {
     /// The secret management attributes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,6 +273,7 @@ pub struct SecretProperties {
     pub content_type: Option<String>,
 
     /// Secret identifier.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
@@ -274,6 +282,7 @@ pub struct SecretProperties {
     pub managed: Option<bool>,
 
     /// Application specific metadata in the form of key-value pairs.
+    #[safe(false)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<HashMap<String, String>>,
 }
