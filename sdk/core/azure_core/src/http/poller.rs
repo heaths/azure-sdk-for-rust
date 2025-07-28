@@ -14,7 +14,7 @@ use serde::Deserialize;
 use std::{
     convert::Infallible,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     pin::Pin,
     str::FromStr,
     task::{Context, Poll},
@@ -386,6 +386,45 @@ impl<T> fmt::Debug for Poller<T> {
         f.write_str("Poller")
     }
 }
+
+impl<M> IntoFuture for Poller<M>
+where
+    M: StatusMonitor,
+{
+    type Output = crate::Result<M::Output>;
+    type IntoFuture = PollerFuture<M>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        PollerFuture {
+            stream: self.stream,
+        }
+    }
+}
+
+/// Polls a [`Poller`] as a [`Stream`] until completion, returning its final output if successful.
+#[pin_project::pin_project]
+pub struct PollerFuture<M> {
+    #[pin]
+    stream: Pin<BoxedStream<M>>,
+}
+
+impl<M> Future for PollerFuture<M>
+where
+    M: StatusMonitor,
+{
+    type Output = crate::Result<M::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        todo!()
+    }
+}
+
+impl<M> fmt::Debug for PollerFuture<M> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PollerFuture")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State<N> {
     Init,
