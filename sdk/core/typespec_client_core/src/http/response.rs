@@ -109,6 +109,11 @@ impl<T, F> Response<T, F> {
         self.raw.headers()
     }
 
+    /// Get the [`ResponseBody`].
+    pub fn body(&self) -> &ResponseBody {
+        self.raw.body()
+    }
+
     /// Deconstruct the HTTP response into its components.
     pub fn deconstruct(self) -> (StatusCode, Headers, ResponseBody) {
         self.raw.deconstruct()
