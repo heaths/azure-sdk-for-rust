@@ -32,6 +32,12 @@ pub struct ContainerClient {
 }
 
 impl ContainerClient {
+    /// Returns the resolved [`ContainerReference`] for the container this client is attached to.
+    #[cfg(feature = "preview_dtx")]
+    pub(crate) fn container_reference(&self) -> &ContainerReference {
+        &self.container_ref
+    }
+
     pub(crate) async fn new(
         context: ClientContext,
         container_id: &str,

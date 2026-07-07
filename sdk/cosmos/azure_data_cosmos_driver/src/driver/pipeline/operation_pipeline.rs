@@ -641,6 +641,8 @@ pub(crate) async fn execute_operation_pipeline(
                     new_state,
                     location_state_store,
                     operation.is_read_only(),
+                    operation.operation_type().routes_to_write_endpoints(),
+                    is_distributed_transaction_operation(operation),
                 );
                 diagnostics = enforce_deadline_or_timeout(deadline, options, diagnostics)?;
             }
@@ -656,7 +658,22 @@ pub(crate) async fn execute_operation_pipeline(
                     new_state,
                     location_state_store,
                     operation.is_read_only(),
+                    operation.operation_type().routes_to_write_endpoints(),
+                    is_distributed_transaction_operation(operation),
                 );
+                diagnostics = enforce_deadline_or_timeout(deadline, options, diagnostics)?;
+            }
+            #[cfg(feature = "preview_dtx")]
+            OperationAction::DtxRetry { new_state, delay } => {
+                tracing::debug!(
+                    activity_id = %activity_id,
+                    delay = ?delay,
+                    dtx_coordinator_retries = new_state.dtx_coordinator_retry_count,
+                    dtx_infra_retries = new_state.dtx_infra_retry_count,
+                    "dtx bodyless retry triggered",
+                );
+                apply_failover_delay(Some(delay)).await;
+                retry_state = new_state;
                 diagnostics = enforce_deadline_or_timeout(deadline, options, diagnostics)?;
             }
             OperationAction::Abort { error } => {
@@ -728,6 +745,8 @@ pub(crate) async fn execute_operation_pipeline(
                     new_state,
                     location_state_store,
                     operation.is_read_only(),
+                    operation.operation_type().routes_to_write_endpoints(),
+                    is_distributed_transaction_operation(operation),
                 );
                 // Re-resolve the primary routing against the advanced
                 // retry_state and freshly snapshotted location. The
@@ -961,6 +980,7 @@ fn resolve_endpoint(
 ) -> RoutingDecision {
     let account = location.account.as_ref();
     let read_only = operation.is_read_only();
+    let route_to_write_endpoints = operation.operation_type().routes_to_write_endpoints();
     // Build an in-flight skip set from effects deferred during this
     // operation. On retries this skips regions we've already failed against
     // so the next attempt picks a different region. Both kinds of deferred
@@ -970,7 +990,7 @@ fn resolve_endpoint(
     //
     // Multi-write retries rotate via `LocationIndex`; PPAF single-master writes
     // use the read endpoint list to discover the current write region.
-    let in_flight_failed: Vec<&Region> = if !read_only {
+    let in_flight_failed: Vec<&Region> = if route_to_write_endpoints {
         retry_state
             .pending_write_effects
             .iter()
@@ -984,7 +1004,13 @@ fn resolve_endpoint(
         Vec::new()
     };
 
-    let primary = preferred_endpoints_for_attempt(account, retry_state, read_only);
+    let primary = preferred_endpoints_for_attempt(
+        account,
+        retry_state,
+        read_only,
+        route_to_write_endpoints,
+        is_distributed_transaction_operation(operation),
+    );
     let selected = try_select_endpoint(
         operation,
         retry_state,
@@ -1049,8 +1075,12 @@ fn resolve_endpoint(
             // default endpoint, but no pipeline operation should run before
             // topology discovery completes. The `debug_assert!` below
             // guards that invariant.
-            account
-                .preferred_write_endpoints
+            let fallback_write_endpoints = if is_distributed_transaction_operation(operation) {
+                &account.account_write_endpoints
+            } else {
+                &account.preferred_write_endpoints
+            };
+            fallback_write_endpoints
                 .first()
                 .expect("preferred_write_endpoints is always non-empty")
                 .clone()
@@ -1160,12 +1190,31 @@ fn resolve_endpoint(
     }
 }
 
+fn is_distributed_transaction_operation(operation: &CosmosOperation) -> bool {
+    #[cfg(feature = "preview_dtx")]
+    {
+        operation.resource_type() == crate::models::ResourceType::DistributedTransactionBatch
+    }
+
+    #[cfg(not(feature = "preview_dtx"))]
+    {
+        let _ = operation;
+        false
+    }
+}
+
 fn preferred_endpoints_for_attempt<'a>(
     account: &'a AccountEndpointState,
     retry_state: &OperationRetryState,
     read_only: bool,
+    route_to_write_endpoints: bool,
+    is_distributed_transaction: bool,
 ) -> &'a [CosmosEndpoint] {
-    if read_only && retry_state.route_reads_to_write_endpoints() {
+    if is_distributed_transaction {
+        &account.account_write_endpoints
+    } else if read_only
+        && (route_to_write_endpoints || retry_state.route_reads_to_write_endpoints())
+    {
         &account.preferred_write_endpoints
     } else if !read_only && retry_state.ppaf_write_retry_allowed {
         // PPAF on single-master accounts: writes iterate over the full read
@@ -1424,6 +1473,8 @@ fn build_transport_request(
         endpoint: ctx.routing.endpoint.clone(),
         url,
         headers,
+        #[cfg(feature = "preview_dtx")]
+        resource_type,
         body: operation.body().map(azure_core::Bytes::copy_from_slice),
         auth_context,
         execution_context: ctx.execution_context,
@@ -1677,11 +1728,18 @@ fn advance_to_next_attempt(
     new_state: OperationRetryState,
     location_state_store: &LocationStateStore,
     is_read_only: bool,
+    route_to_write_endpoints: bool,
+    is_distributed_transaction: bool,
 ) {
     let next_location = location_state_store.snapshot();
-    let endpoints_len =
-        preferred_endpoints_for_attempt(next_location.account.as_ref(), &new_state, is_read_only)
-            .len();
+    let endpoints_len = preferred_endpoints_for_attempt(
+        next_location.account.as_ref(),
+        &new_state,
+        is_read_only,
+        route_to_write_endpoints,
+        is_distributed_transaction,
+    )
+    .len();
     let pending = std::mem::take(&mut retry_state.pending_write_effects);
     *retry_state = new_state.advance_location(endpoints_len, next_location.account.generation);
     retry_state.pending_write_effects = pending;
@@ -3404,8 +3462,13 @@ fn try_advance_after_both_transient(
     }
 
     retry_state.failover_retry_count = next_count;
-    let endpoints =
-        preferred_endpoints_for_attempt(location.account.as_ref(), retry_state, is_read_only);
+    let endpoints = preferred_endpoints_for_attempt(
+        location.account.as_ref(),
+        retry_state,
+        is_read_only,
+        !is_read_only,
+        false,
+    );
     let endpoints_len = endpoints.len();
     if endpoints_len > 0 {
         // Walk the LocationIndex forward starting from its current
@@ -3949,6 +4012,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint].into(),
             preferred_write_endpoints: vec![write_endpoint.clone()].into(),
+            account_write_endpoints: vec![write_endpoint.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: write_endpoint.clone(),
@@ -3959,6 +4023,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 1,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -3986,6 +4054,103 @@ mod tests {
         assert_eq!(routing.endpoint, write_endpoint);
     }
 
+    #[cfg(feature = "preview_dtx")]
+    #[test]
+    fn resolve_endpoint_uses_account_write_region_order_for_read_dtx() {
+        let operation = CosmosOperation::distributed_transaction(
+            test_account(),
+            crate::models::DistributedTransactionType::Read,
+        );
+        let account_write_endpoint = CosmosEndpoint::regional(
+            "eastus".into(),
+            Url::parse("https://test-eastus.documents.azure.com:443/").unwrap(),
+        );
+        let preferred_write_endpoint = CosmosEndpoint::regional(
+            "westus3".into(),
+            Url::parse("https://test-westus3.documents.azure.com:443/").unwrap(),
+        );
+        let read_endpoint = CosmosEndpoint::regional(
+            "westus2".into(),
+            Url::parse("https://test-westus2.documents.azure.com:443/").unwrap(),
+        );
+
+        let location = LocationSnapshot::for_tests(Arc::new(AccountEndpointState {
+            generation: 0,
+            preferred_read_endpoints: vec![read_endpoint].into(),
+            preferred_write_endpoints: vec![preferred_write_endpoint].into(),
+            account_write_endpoints: vec![account_write_endpoint.clone()].into(),
+            unavailable_endpoints: Default::default(),
+            multiple_write_locations_enabled: false,
+            default_endpoint: account_write_endpoint.clone(),
+        }));
+
+        let retry_state = crate::driver::pipeline::components::OperationRetryState::initial(
+            0,
+            false,
+            Vec::new(),
+            3,
+            1,
+        );
+
+        let routing = super::resolve_endpoint(
+            &operation,
+            &retry_state,
+            &location,
+            false,
+            Duration::from_secs(60),
+        );
+        assert_eq!(routing.endpoint, account_write_endpoint);
+    }
+
+    #[cfg(feature = "preview_dtx")]
+    #[test]
+    fn resolve_endpoint_uses_account_write_region_order_for_write_dtx() {
+        let operation = CosmosOperation::distributed_transaction(
+            test_account(),
+            crate::models::DistributedTransactionType::Write,
+        );
+        let account_write_endpoint = CosmosEndpoint::regional(
+            "eastus".into(),
+            Url::parse("https://test-eastus.documents.azure.com:443/").unwrap(),
+        );
+        let preferred_write_endpoint = CosmosEndpoint::regional(
+            "westus3".into(),
+            Url::parse("https://test-westus3.documents.azure.com:443/").unwrap(),
+        );
+        let read_endpoint = CosmosEndpoint::regional(
+            "westus2".into(),
+            Url::parse("https://test-westus2.documents.azure.com:443/").unwrap(),
+        );
+
+        let location = LocationSnapshot::for_tests(Arc::new(AccountEndpointState {
+            generation: 0,
+            preferred_read_endpoints: vec![read_endpoint].into(),
+            preferred_write_endpoints: vec![preferred_write_endpoint].into(),
+            account_write_endpoints: vec![account_write_endpoint.clone()].into(),
+            unavailable_endpoints: Default::default(),
+            multiple_write_locations_enabled: true,
+            default_endpoint: account_write_endpoint.clone(),
+        }));
+
+        let mut retry_state = crate::driver::pipeline::components::OperationRetryState::initial(
+            0,
+            true,
+            Vec::new(),
+            3,
+            1,
+        );
+        retry_state.ppaf_write_retry_allowed = true;
+
+        let routing = super::resolve_endpoint(
+            &operation,
+            &retry_state,
+            &location,
+            false,
+            Duration::from_secs(60),
+        );
+        assert_eq!(routing.endpoint, account_write_endpoint);
+    }
+
     #[test]
     fn resolve_endpoint_deprioritizes_unavailable_over_global_fallback() {
         let operation = CosmosOperation::read_all_databases(test_account());
@@ -4009,6 +4174,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![default_endpoint.clone()].into(),
+            account_write_endpoints: vec![default_endpoint.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4019,6 +4185,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4069,6 +4239,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![read_endpoint.clone()].into(),
+            account_write_endpoints: vec![read_endpoint.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: read_endpoint.clone(),
@@ -4079,6 +4250,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4136,6 +4311,12 @@ mod tests {
                 endpoint_c.clone(),
             ]
             .into(),
+            account_write_endpoints: vec![
+                endpoint_a.clone(),
+                endpoint_b.clone(),
+                endpoint_c.clone(),
+            ]
+            .into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: endpoint_a.clone(),
@@ -4146,6 +4327,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 3,
@@ -4305,6 +4490,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![endpoint.clone()].into(),
             preferred_write_endpoints: vec![endpoint.clone()].into(),
+            account_write_endpoints: vec![endpoint.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: endpoint.clone(),
@@ -4362,7 +4548,8 @@ mod tests {
         let location = LocationSnapshot::for_tests(Arc::new(AccountEndpointState {
             generation: 0,
             preferred_read_endpoints: vec![endpoint.clone(), fallback_endpoint.clone()].into(),
-            preferred_write_endpoints: vec![endpoint].into(),
+            preferred_write_endpoints: vec![endpoint.clone()].into(),
+            account_write_endpoints: vec![endpoint].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: true,
             default_endpoint: fallback_endpoint.clone(),
@@ -4409,6 +4596,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![hub_endpoint.clone()].into(),
+            account_write_endpoints: vec![hub_endpoint.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4419,6 +4607,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4469,6 +4661,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![hub_endpoint.clone()].into(),
+            account_write_endpoints: vec![hub_endpoint.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4479,6 +4672,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4531,6 +4728,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![hub_endpoint.clone()].into(),
+            account_write_endpoints: vec![hub_endpoint.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4541,6 +4739,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4606,6 +4808,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![read_endpoint.clone()].into(),
             preferred_write_endpoints: vec![hub_endpoint.clone()].into(),
+            account_write_endpoints: vec![hub_endpoint.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4616,6 +4819,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4692,6 +4899,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![isolated_endpoint.clone(), hub_endpoint.clone()].into(),
             preferred_write_endpoints: vec![hub_endpoint.clone()].into(),
+            account_write_endpoints: vec![hub_endpoint.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -4702,6 +4910,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 3,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -4785,6 +4997,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![r1.clone(), r2.clone()].into(),
             preferred_write_endpoints: vec![r1.clone(), r2.clone()].into(),
+            account_write_endpoints: vec![r1.clone(), r2.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: true,
             default_endpoint: r1.clone(),
@@ -4866,6 +5079,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![r1.clone(), r2.clone()].into(),
             preferred_write_endpoints: vec![r1.clone(), r2.clone()].into(),
+            account_write_endpoints: vec![r1.clone(), r2.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: true,
             default_endpoint: r1.clone(),
@@ -4943,6 +5157,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![hub.clone(), satellite.clone()].into(),
             preferred_write_endpoints: vec![hub.clone()].into(),
+            account_write_endpoints: vec![hub.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: hub.clone(),
@@ -5007,6 +5222,7 @@ mod tests {
             ]
             .into(),
             preferred_write_endpoints: vec![default_endpoint.clone()].into(),
+            account_write_endpoints: vec![default_endpoint.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: default_endpoint.clone(),
@@ -5067,6 +5283,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone(), west.clone()].into(),
             preferred_write_endpoints: vec![east.clone(), west.clone()].into(),
+            account_write_endpoints: vec![east.clone(), west.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: east.clone(),
@@ -5117,6 +5334,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone(), west.clone()].into(),
             preferred_write_endpoints: vec![east.clone(), west.clone()].into(),
+            account_write_endpoints: vec![east.clone(), west.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: east.clone(),
@@ -5170,6 +5388,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![west.clone(), east.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -5218,6 +5437,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone(), west.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -5280,6 +5500,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone()].into(),
+            account_write_endpoints: vec![north.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: north.clone(),
@@ -5361,6 +5582,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone()].into(),
+            account_write_endpoints: vec![north.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: north.clone(),
@@ -5464,6 +5686,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone(), central.clone()].into(),
+            account_write_endpoints: vec![north.clone(), central.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: north.clone(),
@@ -5517,6 +5740,7 @@ mod tests {
             generation: 1,
             preferred_read_endpoints: vec![north.clone()].into(),
             preferred_write_endpoints: vec![north.clone()].into(),
+            account_write_endpoints: vec![north.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: north.clone(),
@@ -5582,6 +5806,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone(), central.clone()].into(),
+            account_write_endpoints: vec![north.clone(), central.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: true,
             default_endpoint: north.clone(),
@@ -5633,6 +5858,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone(), central.clone()].into(),
+            account_write_endpoints: vec![north.clone(), central.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: north.clone(),
@@ -5688,6 +5914,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone()].into(),
+            account_write_endpoints: vec![north.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: north.clone(),
@@ -5770,6 +5997,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![north.clone(), central.clone()].into(),
             preferred_write_endpoints: vec![north.clone()].into(),
+            account_write_endpoints: vec![north.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: north.clone(),
@@ -5841,6 +6069,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![central.clone(), east.clone()].into(),
             preferred_write_endpoints: vec![central.clone(), east.clone()].into(),
+            account_write_endpoints: vec![central.clone(), east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: central.clone(),
@@ -5916,6 +6145,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![central.clone(), east.clone()].into(),
             preferred_write_endpoints: vec![central.clone(), east.clone()].into(),
+            account_write_endpoints: vec![central.clone(), east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: central.clone(),
@@ -5998,6 +6228,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![central.clone(), east.clone()].into(),
             preferred_write_endpoints: vec![central.clone(), east.clone()].into(),
+            account_write_endpoints: vec![central.clone(), east.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: true,
             default_endpoint: central.clone(),
@@ -6082,6 +6313,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![central.clone(), east.clone()].into(),
             preferred_write_endpoints: vec![central.clone(), east.clone()].into(),
+            account_write_endpoints: vec![central.clone(), east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: true,
             default_endpoint: central.clone(),
@@ -6141,6 +6373,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -6187,6 +6420,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: unavailable,
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -6212,6 +6446,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -6265,6 +6500,7 @@ mod tests {
                 generation: 0,
                 preferred_read_endpoints: vec![east.clone(), west.clone()].into(),
                 preferred_write_endpoints: vec![east.clone()].into(),
+                account_write_endpoints: vec![east.clone()].into(),
                 unavailable_endpoints: Default::default(),
                 multiple_write_locations_enabled: false,
                 default_endpoint: east.clone(),
@@ -6323,6 +6559,7 @@ mod tests {
                 generation: 0,
                 preferred_read_endpoints: vec![east.clone()].into(),
                 preferred_write_endpoints: vec![east.clone()].into(),
+                account_write_endpoints: vec![east.clone()].into(),
                 unavailable_endpoints: Default::default(),
                 multiple_write_locations_enabled: false,
                 default_endpoint: east.clone(),
@@ -6354,6 +6591,7 @@ mod tests {
             generation: 0,
             preferred_read_endpoints: vec![east.clone()].into(),
             preferred_write_endpoints: vec![east.clone()].into(),
+            account_write_endpoints: vec![east.clone()].into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: east.clone(),
@@ -7494,6 +7732,10 @@ mod tests {
             failover_retry_count: 0,
             session_token_retry_count: 0,
             backend_failover_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_coordinator_retry_count: 0,
+            #[cfg(feature = "preview_dtx")]
+            dtx_infra_retry_count: 0,
             max_failover_retries: 10,
             max_backend_failover_retries: 120,
             max_session_retries: 2,
@@ -7518,7 +7760,8 @@ mod tests {
         super::LocationSnapshot::for_tests(Arc::new(AccountEndpointState {
             generation: 0,
             preferred_read_endpoints: endpoints.clone().into(),
-            preferred_write_endpoints: endpoints.into(),
+            preferred_write_endpoints: endpoints.clone().into(),
+            account_write_endpoints: endpoints.into(),
             unavailable_endpoints: Default::default(),
             multiple_write_locations_enabled: false,
             default_endpoint: default,
