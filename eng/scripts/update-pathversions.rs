@@ -2,7 +2,7 @@
 ---
 [package]
 edition = "2021"
-description = "In all Cargo.toml files in the repo, for all dependencies that have both path and version properties, update the version property to the version in the package."
+description = "In all Cargo.toml files in the repo, for all dependencies that have both path and version properties, or for workspace samples, update the version property to the version in the package."
 
 [dependencies]
 regex = "1.5"
@@ -41,12 +41,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             toml_file.document.as_table_mut(),
             &package_versions,
             should_add,
+            toml_file.is_sample_manifest,
         );
 
         // if the toml file has a workspace table, update the workspace table
         if let Some(workspace) = toml_file.document.get_mut("workspace") {
             if let Some(table) = workspace.as_table_mut() {
-                update_package_versions(table, &package_versions, should_add);
+                update_package_versions(
+                    table,
+                    &package_versions,
+                    should_add,
+                    toml_file.is_sample_manifest,
+                );
             }
         }
 
@@ -79,12 +85,14 @@ fn load_cargo_toml_files(
         let package_version = package_table
             .and_then(|table| table.get("version"))
             .and_then(Item::as_str);
+        let is_sample_manifest = path.starts_with(repo_root.join("samples"));
 
         toml_files.push(TomlInfo {
             path,
             package_name: package_name.map(|s| s.to_string()),
             package_version: package_version.map(|s| s.to_string()),
             is_publish_disabled: publish_property == Some(false),
+            is_sample_manifest,
             document: doc,
         });
     }
@@ -132,6 +140,7 @@ fn update_package_versions(
     toml: &mut Table,
     package_versions: &Vec<(String, String, bool)>,
     add: bool,
+    is_sample_manifest: bool,
 ) {
     // for each dependency table, for each package in package_versions
     // if the package is in the dependency table
@@ -154,8 +163,11 @@ fn update_package_versions(
 
                 let has_path_property = dependency.get("path").is_some();
                 let has_version_property = dependency.get("version").is_some();
+                let should_update_sample_version = is_sample_manifest && has_version_property;
 
-                if has_path_property && (has_version_property || should_add) {
+                if (has_path_property || should_update_sample_version)
+                    && (has_version_property || should_add)
+                {
                     dependency["version"] = value(version);
                 }
             }
@@ -183,5 +195,6 @@ struct TomlInfo {
     package_name: Option<String>,
     package_version: Option<String>,
     is_publish_disabled: bool,
+    is_sample_manifest: bool,
     document: DocumentMut,
 }
